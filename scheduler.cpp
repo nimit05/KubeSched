@@ -1,173 +1,461 @@
 #include "scheduler.h"
 
-#include <deque>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
 #include <queue>
+#include <set>
+#include <tuple>
 #include <vector>
 
 using namespace std;
 
-using RunningQueue = priority_queue<RunningTask, vector<RunningTask>, greater<RunningTask>>;
-
-static int chooseThread(const SimulationInput &input, int sid, int need)
+namespace
 {
-    int best = -1;
-    for (int t = 0; t < input.m; ++t)
-    {
-        const auto &thr = input.services[sid][t];
-        if (thr.availableResources < need)
-            continue;
 
-        if (best == -1 || thr.priority > input.services[sid][best].priority ||
-            (thr.priority == input.services[sid][best].priority &&
-             thr.availableResources > input.services[sid][best].availableResources) ||
-            (thr.priority == input.services[sid][best].priority &&
-             thr.availableResources == input.services[sid][best].availableResources &&
-             thr.id < input.services[sid][best].id))
+enum class PodState
+{
+    NotArrived,
+    Pending,
+    Running,
+    Done,
+    Dropped
+};
+
+struct PodStatus
+{
+    PodState state = PodState::NotArrived;
+    int nodeId = -1;
+    int runId = 0; // bumped on every bind so completions of preempted runs can be ignored
+    long long enqueueTime = 0;
+    long long startTime = -1;
+    long long finishTime = -1;
+    long long waited = 0; // total time spent pending, across every requeue
+    bool delayed = false;
+};
+
+struct Completion
+{
+    long long finishTime = 0;
+    int podId = -1;
+    int runId = 0;
+
+    bool operator>(const Completion &other) const
+    {
+        if (finishTime != other.finishTime)
+            return finishTime > other.finishTime;
+        return podId > other.podId;
+    }
+};
+
+// pending pods are tried highest priority first, then oldest first
+struct PendingOrder
+{
+    const vector<Pod> *pods = nullptr;
+
+    bool operator()(int a, int b) const
+    {
+        const Pod &pa = (*pods)[a], &pb = (*pods)[b];
+        if (pa.priority != pb.priority)
+            return pa.priority > pb.priority;
+        if (pa.arrivalTime != pb.arrivalTime)
+            return pa.arrivalTime < pb.arrivalTime;
+        return a < b;
+    }
+};
+
+void addTo(Node &node, const Pod &pod)
+{
+    node.allocated.cpu += pod.request.cpu;
+    node.allocated.mem += pod.request.mem;
+    ++node.podCount;
+}
+
+void removeFrom(Node &node, const Pod &pod)
+{
+    node.allocated.cpu -= pod.request.cpu;
+    node.allocated.mem -= pod.request.mem;
+    --node.podCount;
+}
+
+// discrete-event simulation: time jumps between pod arrivals, pod completions and pending timeouts
+class Simulator
+{
+public:
+    Simulator(const SimulationInput &input, const SchedulingPolicy &policy, const SimulationConfig &config)
+        : pods(input.pods), nodes(input.nodes), policy(policy), config(config),
+          status(input.pods.size()), runningOn(input.nodes.size()), pending(PendingOrder{&input.pods})
+    {
+        for (size_t i = 0; i < nodes.size(); ++i)
         {
-            best = t;
+            nodes[i].id = static_cast<int>(i);
+            nodes[i].allocated = Resources{};
+            nodes[i].podCount = 0;
+            totalCapacity.cpu += nodes[i].capacity.cpu;
+            totalCapacity.mem += nodes[i].capacity.mem;
         }
     }
-    return best;
-}
 
-// this function tries to assign a request to a worker thread, it calls the chooseThread function to find a suitable worker thread for the request,adds a new RunningTask to the running queue
-static bool assignRequest(SimulationInput &input, SimulationResult &res,
-                          vector<long long> &st, vector<long long> &ft,
-                          RunningQueue &running, int rid, long long now)
-{
-    auto &q = input.requests[rid];
-    if (q.serviceId < 0 || q.serviceId >= input.n || q.resourcesRequired < 0 ||
-        q.resourcesRequired > input.maxThreadResources[q.serviceId])
+    SimulationResult run()
     {
-        if (!q.rejected)
-            ++res.rejectedCount;
-        q.rejected = true;
-        return false;
-    }
+        res.totalPods = static_cast<long long>(pods.size());
+        if (pods.empty())
+            return res;
 
-    int tid = chooseThread(input, q.serviceId, q.resourcesRequired);
-    if (tid == -1)
-        return false;
+        vector<int> order(pods.size());
+        iota(order.begin(), order.end(), 0);
+        stable_sort(order.begin(), order.end(), [&](int a, int b)
+                    { return pods[a].arrivalTime < pods[b].arrivalTime; });
 
-    input.services[q.serviceId][tid].availableResources -= q.resourcesRequired;
-    st[rid] = now;
-    ft[rid] = now + q.duration;
-    running.push(RunningTask{ft[rid], q.serviceId, tid, rid, q.resourcesRequired});
-    res.processedOrder.push_back(AssignmentRecord{now, rid, q.serviceId, tid});
-    return true;
-}
+        const long long never = numeric_limits<long long>::max();
+        long long start = pods[order[0]].arrivalTime;
+        lastTime = start;
+        windowEnd = pods[order.back()].arrivalTime;
+        size_t next = 0;
 
-// if the request is not rejected, it is added back to the waiting queue , this process continues until there are no more requests in the waiting queue or no progress can be made in assigning requests.
-static void scheduleWaitingForService(SimulationInput &input, SimulationResult &res,
-                                      vector<long long> &st, vector<long long> &ft,
-                                      vector<deque<int>> &waiting,
-                                      RunningQueue &running, int sid, long long now)
-{
-    bool progress = true;
-    while (progress && !waiting[sid].empty())
-    {
-        progress = false;
-        int rounds = static_cast<int>(waiting[sid].size());
-        for (int i = 0; i < rounds; ++i)
+        while (true)
         {
-            int rid = waiting[sid].front();
-            waiting[sid].pop_front();
-            if (assignRequest(input, res, st, ft, running, rid, now))
-                progress = true;
-            else if (!input.requests[rid].rejected)
-                waiting[sid].push_back(rid);
+            long long now = never;
+            if (next < order.size())
+                now = min(now, pods[order[next]].arrivalTime);
+            if (!completions.empty())
+                now = min(now, completions.top().finishTime);
+            if (config.maxWait > 0 && !pending.empty())
+                now = min(now, nextDeadline());
+            if (now == never)
+                break;
+
+            advanceTo(now);
+            releaseFinished(now);
+            while (next < order.size() && pods[order[next]].arrivalTime <= now)
+                admit(order[next++], now);
+            schedulePass(now);
+            if (config.maxWait > 0)
+                dropTimedOut(now);
         }
-    }
-}
 
-// this function releases all finished tasks until the given time limit, it updates the available resources for the corresponding worker threads and schedules any waiting requests for the services that have finished tasks
-static void releaseFinishedUntil(SimulationInput &input, SimulationResult &res,
-                                 vector<long long> &st, vector<long long> &ft,
-                                 vector<deque<int>> &waiting,
-                                 RunningQueue &running, long long limit)
-{
-    while (!running.empty() && running.top().finishTime <= limit)
-    {
-        auto done = running.top();
-        running.pop();
-        input.services[done.serviceId][done.threadId].availableResources += done.resourcesAllocated;
-        scheduleWaitingForService(input, res, st, ft, waiting, running,
-                                  done.serviceId, done.finishTime);
-    }
-}
+        // only reachable if a filter rejects every node forever, count such pods as unschedulable
+        for (int pid : pending)
+        {
+            status[pid].state = PodState::Dropped;
+            ++res.unschedulablePods;
+        }
+        pending.clear();
 
-SimulationResult runSimulation(SimulationInput input)
-{
-    SimulationResult res;
-    if (input.n <= 0 || input.m <= 0)
+        finalize(start);
         return res;
+    }
 
-    vector<deque<int>> waiting(input.n);
-    vector<long long> st(input.requests.size(), -1), ft(input.requests.size(), -1);
-    RunningQueue running;
+private:
+    const vector<Pod> &pods;
+    vector<Node> nodes;
+    const SchedulingPolicy &policy;
+    SimulationConfig config;
+    vector<PodStatus> status;
+    vector<vector<int>> runningOn;
+    set<int, PendingOrder> pending;
+    priority_queue<Completion, vector<Completion>, greater<Completion>> completions;
+    multiset<int> runningPriorities;
+    SimulationResult res;
 
-    // waiting is a vector of deques, where each deque corresponds to a service and contains the request IDs that are waiting for that service, st and ft are vectors that store the start time and finish time of each request respectively
+    Resources totalCapacity;
+    Resources clusterAllocated;
+    int activeNodes = 0;
+    long long lastTime = 0;
+    long long windowEnd = 0; // last arrival time
+    long double cpuArea = 0.0L, memArea = 0.0L, activeArea = 0.0L;
+    long double cpuWindowArea = 0.0L, memWindowArea = 0.0L;
 
-    for (size_t i = 0; i < input.requests.size(); ++i)
+    // integrates cluster usage over the interval since the previous event
+    void advanceTo(long long now)
     {
-        // now is the arrival time of the current request, releaseFinishedUntil is called to release any finished tasks until the arrival time of the current request
-        long long now = input.requests[i].arrivalTime;
-        releaseFinishedUntil(input, res, st, ft, waiting, running, now);
-
-        int rid = static_cast<int>(i);
-        if (assignRequest(input, res, st, ft, running, rid, now) || input.requests[rid].rejected)
-            continue;
-
-        ++res.delayedCount;
-        int sid = input.requests[rid].serviceId;
-        if (sid >= 0 && sid < input.n && chooseThread(input, sid, input.requests[rid].resourcesRequired) == -1)
+        long long dt = now - lastTime;
+        if (dt > 0)
         {
-            ++res.blockedCount;
+            cpuArea += static_cast<long double>(dt) * clusterAllocated.cpu;
+            memArea += static_cast<long double>(dt) * clusterAllocated.mem;
+            activeArea += static_cast<long double>(dt) * activeNodes;
         }
-        if (sid >= 0 && sid < input.n)
-            waiting[sid].push_back(rid);
-        else
+        long long inWindow = min(now, windowEnd) - lastTime;
+        if (inWindow > 0)
         {
-            input.requests[rid].rejected = true;
-            ++res.rejectedCount;
+            cpuWindowArea += static_cast<long double>(inWindow) * clusterAllocated.cpu;
+            memWindowArea += static_cast<long double>(inWindow) * clusterAllocated.mem;
+        }
+        lastTime = now;
+    }
+
+    void place(int pid, int nid)
+    {
+        Node &node = nodes[nid];
+        if (node.podCount == 0)
+            ++activeNodes;
+        addTo(node, pods[pid]);
+        clusterAllocated.cpu += pods[pid].request.cpu;
+        clusterAllocated.mem += pods[pid].request.mem;
+        runningOn[nid].push_back(pid);
+        runningPriorities.insert(pods[pid].priority);
+        status[pid].nodeId = nid;
+    }
+
+    void unplace(int pid)
+    {
+        int nid = status[pid].nodeId;
+        Node &node = nodes[nid];
+        removeFrom(node, pods[pid]);
+        if (node.podCount == 0)
+            --activeNodes;
+        clusterAllocated.cpu -= pods[pid].request.cpu;
+        clusterAllocated.mem -= pods[pid].request.mem;
+        auto &list = runningOn[nid];
+        list.erase(find(list.begin(), list.end(), pid));
+        runningPriorities.erase(runningPriorities.find(pods[pid].priority));
+        status[pid].nodeId = -1;
+    }
+
+    void bind(int pid, int nid, long long now)
+    {
+        PodStatus &st = status[pid];
+        place(pid, nid);
+        st.state = PodState::Running;
+        st.startTime = now;
+        st.waited += now - st.enqueueTime;
+        ++st.runId;
+        completions.push(Completion{now + pods[pid].duration, pid, st.runId});
+        res.events.push_back(ScheduleEvent{now, EventKind::Bind, pid, nid, -1});
+    }
+
+    void enqueue(int pid, long long now)
+    {
+        status[pid].state = PodState::Pending;
+        status[pid].enqueueTime = now;
+        pending.insert(pid);
+    }
+
+    bool fitsEmptyNode(const Pod &pod) const
+    {
+        for (const auto &n : nodes)
+        {
+            Node empty = n;
+            empty.allocated = Resources{};
+            empty.podCount = 0;
+            if (policy.feasible(pod, empty))
+                return true;
+        }
+        return false;
+    }
+
+    // a pod that cannot fit even on an empty node is rejected right away instead of waiting forever
+    void admit(int pid, long long now)
+    {
+        if (!fitsEmptyNode(pods[pid]))
+        {
+            status[pid].state = PodState::Dropped;
+            ++res.unschedulablePods;
+            res.events.push_back(ScheduleEvent{now, EventKind::Unschedulable, pid, -1, -1});
+            return;
+        }
+        enqueue(pid, now);
+    }
+
+    void releaseFinished(long long now)
+    {
+        while (!completions.empty() && completions.top().finishTime <= now)
+        {
+            Completion c = completions.top();
+            completions.pop();
+            PodStatus &st = status[c.podId];
+            if (st.state != PodState::Running || st.runId != c.runId)
+                continue; // this run was preempted
+            unplace(c.podId);
+            st.state = PodState::Done;
+            st.finishTime = c.finishTime;
         }
     }
 
-    // after processing all requests, this loop releases any remaining finished tasks and updates the available resources for the corresponding worker threads,
-    while (!running.empty())
+    void schedulePass(long long now)
     {
-        auto done = running.top();
-        running.pop();
-        input.services[done.serviceId][done.threadId].availableResources += done.resourcesAllocated;
-        scheduleWaitingForService(input, res, st, ft, waiting, running, done.serviceId, done.finishTime);
-    }
-
-    for (int s = 0; s < input.n; ++s)
-    {
-        for (int rid : waiting[s])
+        for (auto it = pending.begin(); it != pending.end();)
         {
-            if (!input.requests[rid].rejected)
+            int pid = *it;
+            int nid = policy.selectNode(pods[pid], nodes);
+            if (nid >= 0)
+                bind(pid, nid, now);
+            else if (!(config.preemption && tryPreempt(pid, now)))
             {
-                input.requests[rid].rejected = true;
-                ++res.rejectedCount;
+                status[pid].delayed = true;
+                ++it;
+                continue;
+            }
+            it = pending.erase(it);
+        }
+    }
+
+    void evict(int victim, int preemptor, long long now)
+    {
+        int nid = status[victim].nodeId;
+        res.lostWork += now - status[victim].startTime;
+        ++res.preemptions;
+        unplace(victim);
+        res.events.push_back(ScheduleEvent{now, EventKind::Preempt, victim, nid, preemptor});
+        // the victim restarts from scratch; it sorts after the preemptor so the current pass still reaches it
+        enqueue(victim, now);
+    }
+
+    // picks the node where evicting the fewest, least important lower-priority pods lets the pod fit
+    bool tryPreempt(int pid, long long now)
+    {
+        const Pod &pod = pods[pid];
+        if (runningPriorities.empty() || *runningPriorities.begin() >= pod.priority)
+            return false;
+
+        int bestNode = -1;
+        vector<int> bestVictims;
+        tuple<int, long long, size_t> bestKey;
+
+        for (size_t n = 0; n < nodes.size(); ++n)
+        {
+            vector<int> candidates;
+            for (int r : runningOn[n])
+                if (pods[r].priority < pod.priority)
+                    candidates.push_back(r);
+            if (candidates.empty())
+                continue;
+
+            Node trial = nodes[n];
+            for (int c : candidates)
+                removeFrom(trial, pods[c]);
+            if (!policy.feasible(pod, trial))
+                continue;
+
+            // give the most important candidates back first and evict only those still in the way
+            sort(candidates.begin(), candidates.end(), [&](int a, int b)
+                 {
+                if (pods[a].priority != pods[b].priority) return pods[a].priority > pods[b].priority;
+                if (status[a].startTime != status[b].startTime) return status[a].startTime < status[b].startTime;
+                return a < b; });
+            vector<int> victims;
+            for (int c : candidates)
+            {
+                addTo(trial, pods[c]);
+                if (!policy.feasible(pod, trial))
+                {
+                    removeFrom(trial, pods[c]);
+                    victims.push_back(c);
+                }
+            }
+
+            int highest = numeric_limits<int>::min();
+            long long sum = 0;
+            for (int v : victims)
+            {
+                highest = max(highest, pods[v].priority);
+                sum += pods[v].priority;
+            }
+            auto key = make_tuple(highest, sum, victims.size());
+            if (bestNode == -1 || key < bestKey)
+            {
+                bestNode = static_cast<int>(n);
+                bestVictims = victims;
+                bestKey = key;
             }
         }
+
+        if (bestNode == -1)
+            return false;
+        for (int v : bestVictims)
+            evict(v, pid, now);
+        bind(pid, bestNode, now);
+        return true;
     }
 
-    long long completed = 0;
-    for (const auto &q : input.requests)
+    long long nextDeadline() const
     {
-        if (!q.rejected && st[q.id] >= 0)
+        long long best = numeric_limits<long long>::max();
+        for (int pid : pending)
+            best = min(best, status[pid].enqueueTime + config.maxWait);
+        return best;
+    }
+
+    void dropTimedOut(long long now)
+    {
+        for (auto it = pending.begin(); it != pending.end();)
         {
-            ++completed;
-            res.avgWaiting += static_cast<long double>(st[q.id] - q.arrivalTime);
-            res.avgTurnaround += static_cast<long double>(ft[q.id] - q.arrivalTime);
+            int pid = *it;
+            if (now - status[pid].enqueueTime >= config.maxWait)
+            {
+                status[pid].state = PodState::Dropped;
+                ++res.timedOutPods;
+                res.events.push_back(ScheduleEvent{now, EventKind::Timeout, pid, -1, -1});
+                it = pending.erase(it);
+            }
+            else
+                ++it;
         }
     }
-    if (completed)
+
+    void finalize(long long start)
     {
-        res.avgWaiting /= completed;
-        res.avgTurnaround /= completed;
+        res.makespan = lastTime - start;
+
+        vector<long double> waits;
+        map<int, pair<long double, long long>> byPriority;
+        for (size_t i = 0; i < pods.size(); ++i)
+        {
+            const PodStatus &st = status[i];
+            if (st.delayed)
+                ++res.delayedPods;
+            if (st.state != PodState::Done)
+                continue;
+            ++res.completedPods;
+            waits.push_back(st.waited);
+            res.avgTurnaround += static_cast<long double>(st.finishTime - pods[i].arrivalTime);
+            auto &slot = byPriority[pods[i].priority];
+            slot.first += st.waited;
+            ++slot.second;
+        }
+
+        if (!waits.empty())
+        {
+            res.avgWaiting = accumulate(waits.begin(), waits.end(), 0.0L) / waits.size();
+            res.avgTurnaround /= waits.size();
+            sort(waits.begin(), waits.end());
+            size_t idx = static_cast<size_t>(ceil(0.95L * waits.size())) - 1;
+            res.p95Waiting = waits[idx];
+        }
+        for (const auto &kv : byPriority)
+            res.avgWaitingByPriority[kv.first] = kv.second.first / kv.second.second;
+
+        if (res.makespan > 0)
+        {
+            if (totalCapacity.cpu > 0)
+                res.cpuUtilization = cpuArea / (static_cast<long double>(totalCapacity.cpu) * res.makespan);
+            if (totalCapacity.mem > 0)
+                res.memUtilization = memArea / (static_cast<long double>(totalCapacity.mem) * res.makespan);
+            res.avgActiveNodes = activeArea / res.makespan;
+        }
+
+        long long window = windowEnd - start;
+        if (window > 0 && totalCapacity.cpu > 0 && totalCapacity.mem > 0)
+        {
+            res.windowCpuUtilization = cpuWindowArea / (static_cast<long double>(totalCapacity.cpu) * window);
+            res.windowMemUtilization = memWindowArea / (static_cast<long double>(totalCapacity.mem) * window);
+        }
+        else
+        {
+            // every pod arrived at once, there is no arrival window to measure
+            res.windowCpuUtilization = res.cpuUtilization;
+            res.windowMemUtilization = res.memUtilization;
+        }
     }
-    return res;
+};
+
+} // namespace
+
+SimulationResult runSimulation(const SimulationInput &input, const SchedulingPolicy &policy,
+                               const SimulationConfig &config)
+{
+    Simulator sim(input, policy, config);
+    return sim.run();
 }
