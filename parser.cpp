@@ -2,10 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <limits>
+#include <climits>
 #include <sstream>
-#include <string>
-#include <unordered_map>
+#include <stdexcept>
 #include <vector>
 
 using namespace std;
@@ -24,98 +23,125 @@ static bool isIntegerToken(const string &s)
     return true;
 }
 
-// this function parses the service index from the given token, it also maintains a mapping of service names to their corresponding indices
-static int parseServiceIndex(const string &token, int serviceCount,
-                             unordered_map<string, int> &serviceMap,
-                             int &nextServiceId)
+static bool toNumber(const string &s, long long &out)
 {
-    if (isIntegerToken(token))
+    if (!isIntegerToken(s))
+        return false;
+    try
     {
-        long long v = stoll(token);
-        if (v >= 1 && v <= serviceCount)
-            return static_cast<int>(v - 1);
-        if (v >= 0 && v < serviceCount)
-            return static_cast<int>(v);
-        return -1;
+        out = stoll(s);
     }
-
-    auto it = serviceMap.find(token);
-    if (it != serviceMap.end())
-        return it->second;
-    if (nextServiceId >= serviceCount)
-        return -1;
-
-    serviceMap[token] = nextServiceId;
-    return nextServiceId++;
+    catch (const out_of_range &)
+    {
+        return false;
+    }
+    return true;
 }
 
-SimulationInput parseInput(istream &in)
+// input format, one record per line, '#' starts a comment:
+//   node <name> <cpu_millicores> <mem_mib> [max_pods]
+//   pod  <name> <cpu_millicores> <mem_mib> <priority> <arrival> <duration>
+bool parseInput(istream &in, SimulationInput &out, string &err)
 {
     SimulationInput data;
-    if (!(in >> data.n >> data.m) || data.n <= 0 || data.m <= 0)
-        return data;
-    data.services.assign(data.n, vector<WorkerThread>(data.m));
-    data.maxThreadResources.assign(data.n, 0);
-
-    // this loop reads the worker thread information for each service and updates the maximum thread resources for each service
-    for (int s = 0; s < data.n; ++s)
-    {
-        for (int t = 0; t < data.m; ++t)
-        {
-            int p = 0, r = 0;
-            if (!(in >> p >> r))
-                return SimulationInput{};
-            data.services[s][t] = WorkerThread{t, p, r, r};
-            data.maxThreadResources[s] = max(data.maxThreadResources[s], r);
-        }
-    }
-
     string line;
-    getline(in, line);
-    vector<vector<string>> rows;
+    int lineNo = 0;
 
     while (getline(in, line))
     {
-        if (line.empty())
-            continue;
+        ++lineNo;
+        size_t hash = line.find('#');
+        if (hash != string::npos)
+            line.erase(hash);
+
         stringstream ss(line);
         vector<string> tok;
         for (string t; ss >> t;)
             tok.push_back(t);
-
-        // tok is a vector of tokens that contains the service index and the resources required for a request, if tok is not empty, it is added to the rows vector
-        if (!tok.empty())
-            rows.push_back(tok);
-    }
-
-    // Accept an optional explicit request count line before request rows.
-    if (!rows.empty() && rows[0].size() == 1 && isIntegerToken(rows[0][0]))
-    {
-        long long q = stoll(rows[0][0]);
-        if (q >= 0 && static_cast<size_t>(q) == rows.size() - 1)
-            rows.erase(rows.begin());
-    }
-
-    unordered_map<string, int> serviceMap;
-    int nextServiceId = 0;
-    data.requests.reserve(rows.size());
-
-    // serviceMap is used to store the mapping of service names to their corresponding indices, nextServiceId is used to assign the next available index to a new service name, this loop parses the service index and resources required for each request and adds it to the requests vector in the SimulationInput structure
-
-    for (size_t i = 0; i < rows.size(); ++i)
-    {
-        if (rows[i].size() < 2)
+        if (tok.empty())
             continue;
-        int sid = parseServiceIndex(rows[i][0], data.n, serviceMap, nextServiceId);
-        int need = numeric_limits<int>::max();
-        if (isIntegerToken(rows[i][1]))
+
+        auto fail = [&](const string &why)
         {
-            long long rr = stoll(rows[i][1]);
-            if (rr >= 0 && rr <= numeric_limits<int>::max())
-                need = static_cast<int>(rr);
+            err = "line " + to_string(lineNo) + ": " + why;
+            return false;
+        };
+
+        // every field after the name is an integer
+        vector<long long> v;
+        for (size_t i = 2; i < tok.size(); ++i)
+        {
+            long long x = 0;
+            if (!toNumber(tok[i], x))
+                return fail("expected an integer, got '" + tok[i] + "'");
+            v.push_back(x);
         }
-        data.requests.push_back(Request{static_cast<int>(data.requests.size()), sid, need,
-                                        static_cast<long long>(i), max(1, need), false});
+
+        if (tok[0] == "node")
+        {
+            if (v.size() != 2 && v.size() != 3)
+                return fail("usage: node <name> <cpu_millicores> <mem_mib> [max_pods]");
+            if (v[0] <= 0 || v[1] <= 0)
+                return fail("node capacity must be positive");
+            Node n;
+            n.name = tok[1];
+            n.capacity = {v[0], v[1]};
+            if (v.size() == 3)
+            {
+                if (v[2] <= 0 || v[2] > INT_MAX)
+                    return fail("max_pods must be a positive int");
+                n.maxPods = static_cast<int>(v[2]);
+            }
+            data.nodes.push_back(n);
+        }
+        else if (tok[0] == "pod")
+        {
+            if (v.size() != 5)
+                return fail("usage: pod <name> <cpu_millicores> <mem_mib> <priority> <arrival> <duration>");
+            if (v[0] < 0 || v[1] < 0)
+                return fail("pod requests cannot be negative");
+            if (v[2] < INT_MIN || v[2] > INT_MAX)
+                return fail("priority out of range");
+            if (v[3] < 0)
+                return fail("arrival time cannot be negative");
+            if (v[4] < 1)
+                return fail("duration must be at least 1");
+            Pod p;
+            p.name = tok[1];
+            p.request = {v[0], v[1]};
+            p.priority = static_cast<int>(v[2]);
+            p.arrivalTime = v[3];
+            p.duration = v[4];
+            data.pods.push_back(p);
+        }
+        else
+            return fail("unknown record '" + tok[0] + "'");
     }
-    return data;
+
+    if (data.nodes.empty())
+    {
+        err = "no nodes defined";
+        return false;
+    }
+
+    stable_sort(data.pods.begin(), data.pods.end(), [](const Pod &a, const Pod &b)
+                { return a.arrivalTime < b.arrivalTime; });
+    for (size_t i = 0; i < data.nodes.size(); ++i)
+        data.nodes[i].id = static_cast<int>(i);
+    for (size_t i = 0; i < data.pods.size(); ++i)
+        data.pods[i].id = static_cast<int>(i);
+
+    out = std::move(data);
+    return true;
+}
+
+void writeInput(ostream &out, const SimulationInput &input)
+{
+    out << "# node <name> <cpu_millicores> <mem_mib> [max_pods]\n";
+    for (const auto &n : input.nodes)
+        out << "node " << n.name << ' ' << n.capacity.cpu << ' ' << n.capacity.mem << ' ' << n.maxPods << '\n';
+    out << "# pod <name> <cpu_millicores> <mem_mib> <priority> <arrival> <duration>\n";
+    for (const auto &p : input.pods)
+        out << "pod " << p.name << ' ' << p.request.cpu << ' ' << p.request.mem << ' ' << p.priority << ' '
+            << p.arrivalTime << ' ' << p.duration << '\n';
 }
