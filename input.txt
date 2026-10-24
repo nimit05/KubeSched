@@ -1,13 +1,13 @@
-2
-2
-5 4
-3 2
-4 3
-1 2
-6
-1 2
-2 3
-1 4
-2 1
-2 5
-1 1
+# node <name> <cpu_millicores> <mem_mib> [max_pods]
+node small-1 2000 4096
+node general-1 4000 16384
+node highmem-1 4000 65536
+
+# pod <name> <cpu_millicores> <mem_mib> <priority> <arrival> <duration>
+pod web-1 500 512 100 0 30
+pod web-2 500 512 100 0 30
+pod batch-1 3000 2048 0 2 60
+pod cache-1 1000 32768 100 3 40
+pod batch-2 3000 4096 0 5 60
+pod api-critical 3000 2048 1000 8 20
+pod huge 32000 1024 0 10 10
