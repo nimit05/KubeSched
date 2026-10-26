@@ -1,0 +1,4 @@
+*.o
+kubesched
+kubesched_tests
+results.csv
